@@ -19,6 +19,9 @@ class PipelineConfig:
 
     # Content selection
     max_experiences: int = 4  # max experience blocks to keep (0 = no limit)
+    min_bullets_per_block: int = 2  # never strip a kept block below this
+    base_bullet_target: float = 2.5  # baseline bullet count per block
+    max_bullet_target: int = 5  # cap for highest-scoring blocks
 
     # Validation settings
     bullet_match_threshold: float = 0.85  # SequenceMatcher ratio for fuzzy matching

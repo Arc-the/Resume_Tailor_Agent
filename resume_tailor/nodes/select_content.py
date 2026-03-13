@@ -7,6 +7,7 @@ keep only the most relevant experiences.
 
 import json
 import logging
+import re
 from collections import defaultdict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -27,6 +28,9 @@ from resume_tailor.prompts.select_content import (
 from resume_tailor.state import ResumeState
 
 logger = logging.getLogger(__name__)
+
+# Pattern for detecting metrics/numbers in bullets (%, $, numbers, etc.)
+_METRIC_PATTERN = re.compile(r'\d+[%xX]|\$[\d,]+|\d{2,}|#\d+')
 
 
 def _score_experience_block(
@@ -124,7 +128,34 @@ def _deterministic_suppressions(
                            f"below top {config.max_experiences})",
                 ))
 
-    # --- Phase 2: Bullet-level suppression within kept blocks ---
+    # --- Phase 2: Compute per-block bullet targets ---
+    # Higher-scoring blocks get more bullets; weaker blocks get fewer.
+    kept_blocks = [b for b in blocks if b.experience_id not in suppressed_block_ids]
+    if not kept_blocks:
+        kept_blocks = blocks  # no suppression happened (fewer than max)
+
+    block_score_map = {b.experience_id: _score_experience_block(b, evidence_map)
+                       for b in kept_blocks}
+    max_score = max(block_score_map.values()) if block_score_map else 1.0
+    max_score = max(max_score, 1.0)  # avoid division by zero
+
+    # target = base + extra bullets scaled by relative score
+    # e.g. base=2.5, max_target=5 → top block gets 5, weakest gets ~2
+    extra_range = config.max_bullet_target - config.base_bullet_target
+    bullet_targets: dict[str, int] = {}
+    for exp_id, score in block_score_map.items():
+        normalized = score / max_score
+        raw_target = config.base_bullet_target + extra_range * normalized
+        target = max(config.min_bullets_per_block,
+                     min(config.max_bullet_target, round(raw_target)))
+        bullet_targets[exp_id] = target
+
+    logger.info(
+        f"Bullet targets: "
+        + ", ".join(f"{eid}={t}" for eid, t in bullet_targets.items())
+    )
+
+    # --- Phase 3: Bullet-level suppression within kept blocks ---
 
     # Build mapping of bullets → requirements
     mapped_bullets: set[str] = set()
@@ -141,19 +172,46 @@ def _deterministic_suppressions(
 
     already_suppressed = {s.source_bullet for s in suppressions}
 
-    # Rule: Bullets with no requirement match → suppress (only in kept blocks)
+    # Group bullets by experience block for target-aware suppression
+    block_bullets: dict[str, list] = defaultdict(list)
     for bullet in all_bullets:
-        if bullet.experience_id in suppressed_block_ids:
-            continue  # already suppressed at block level
-        if bullet.text not in mapped_bullets and bullet.text not in already_suppressed:
-            suppressions.append(SuppressionEntry(
-                source_bullet=bullet.text,
-                experience_id=bullet.experience_id,
-                reason="no requirement match",
-            ))
-            already_suppressed.add(bullet.text)
+        if bullet.experience_id not in suppressed_block_ids:
+            block_bullets[bullet.experience_id].append(bullet)
 
-    # Rule: Duplicate evidence (multiple bullets → same requirement)
+    for exp_id, exp_bullets in block_bullets.items():
+        target = bullet_targets.get(exp_id, config.min_bullets_per_block)
+
+        # Score each bullet for retention priority:
+        #   matched strong > matched weak > unmatched with metrics > unmatched
+        def _bullet_retention_score(b):
+            reqs = bullet_to_requirements.get(b.text, [])
+            if reqs:
+                best = min(
+                    (0 if s == MatchStrength.STRONG else 1)
+                    for _, s in reqs
+                )
+                return best  # 0 = strong match, 1 = weak match
+            # Unmatched — prefer bullets with metrics/numbers
+            has_metric = bool(_METRIC_PATTERN.search(b.text))
+            return 2 if has_metric else 3
+
+        ranked = sorted(exp_bullets, key=_bullet_retention_score)
+
+        # Keep up to target, suppress the rest (worst-ranked first)
+        kept_count = 0
+        for bullet in ranked:
+            if bullet.text in already_suppressed:
+                continue
+            kept_count += 1
+            if kept_count > target:
+                suppressions.append(SuppressionEntry(
+                    source_bullet=bullet.text,
+                    experience_id=bullet.experience_id,
+                    reason="below bullet target (low relevance)",
+                ))
+                already_suppressed.add(bullet.text)
+
+    # Rule: Duplicate evidence (multiple bullets → same requirement, within budget)
     req_to_bullets: dict[str, list[tuple[str, str, MatchStrength]]] = {}
     for mapping in evidence_map:
         for entry in mapping.evidence:
@@ -179,6 +237,13 @@ def _deterministic_suppressions(
         )
         for bullet_text, exp_id, strength in sorted_bullets[1:]:
             if bullet_text not in already_suppressed:
+                # Only suppress duplicates if the block is still above minimum
+                block_remaining = sum(
+                    1 for b in block_bullets.get(exp_id, [])
+                    if b.text not in already_suppressed
+                )
+                if block_remaining <= config.min_bullets_per_block:
+                    continue
                 other_reqs = [
                     r for r, s in bullet_to_requirements.get(bullet_text, [])
                     if r != req
